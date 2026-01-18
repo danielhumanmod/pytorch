@@ -1862,6 +1862,35 @@ def solve_min_cut(
                         f"user.target={user.target}"
                     )
                 if not is_user_required_fw and not is_cur_user_fusible:
+                    # Special case: If the node is a recomputable factory op (e.g., full, ones, zeros),
+                    # it is safe to recompute even if its consumer in backward is not fusible.
+                    # Factory ops are pure functional and create new tensors, so they don't need to be
+                    # materialized just because they can't fuse with their consumers.
+                    if op_types.is_recomputable(cur):
+                        # Check if it's a factory op (creates tensors rather than modifies them)
+                        # Common factory ops: full, ones, zeros, empty, ones_like, zeros_like, etc.
+                        aten_target = get_aten_target(cur)
+                        factory_ops = [
+                            aten.full,
+                            aten.ones,
+                            aten.zeros,
+                            aten.empty,
+                            aten.ones_like,
+                            aten.zeros_like,
+                            aten.empty_like,
+                            aten.full_like,
+                            aten.scalar_tensor,
+                            aten.arange,
+                        ]
+                        if aten_target in factory_ops:
+                            if is_watched:
+                                log.warning(
+                                    f"[DEBUG materialized_backwards] Node {cur.name}: "
+                                    f"Skipping materialized_backwards check for recomputable factory op "
+                                    f"({aten_target}), allowing recompute"
+                                )
+                            continue  # Skip this user, continue checking others
+                    
                     if is_watched:
                         log.warning(
                             f"[DEBUG materialized_backwards] Node {cur.name}: "
