@@ -1850,19 +1850,90 @@ def solve_min_cut(
         return False
 
     def should_ban_recomputation(node):
+        # Debug logging for ones_like, zeros_like and their decompositions
+        # Note: If early decomposition happens, ones_like may be decomposed into
+        # full, fill_, empty, etc. before reaching partitioner
+        node_target_str = str(node.target)
+        watch_list = ["ones_like", "zeros_like", "full", "fill", "empty", "copy"]
+        is_watched = any(op in node_target_str for op in watch_list)
+        
         if node.op != "call_function":
+            if is_watched:
+                log.warning(
+                    f"[DEBUG ones_like/zeros_like] Node {node.name}: "
+                    f"Not a call_function (op={node.op}), returning False"
+                )
             return False
         if node.target is operator.getitem:
+            if is_watched:
+                log.warning(
+                    f"[DEBUG ones_like/zeros_like] Node {node.name}: "
+                    f"Is operator.getitem, returning False"
+                )
             return False
         if node.meta.get("recompute", None) == CheckpointPolicy.MUST_SAVE:
+            if is_watched:
+                log.warning(
+                    f"[DEBUG ones_like/zeros_like] Node {node.name}: "
+                    f"Marked as MUST_SAVE, BANNING recomputation"
+                )
             return True
         if config.recompute_views and op_types.is_view(node):
+            if is_watched:
+                log.warning(
+                    f"[DEBUG ones_like/zeros_like] Node {node.name}: "
+                    f"Is a view and recompute_views=True, returning False"
+                )
             return False
         if node.target in [aten.lift_fresh_copy.default, aten.lift_fresh.default]:
+            if is_watched:
+                log.warning(
+                    f"[DEBUG ones_like/zeros_like] Node {node.name}: "
+                    f"Is lift_fresh_copy/lift_fresh, returning False"
+                )
             return False
 
         if min_cut_options.ban_if_not_in_allowlist:
-            if not op_types.is_recomputable(node):
+            aten_target = get_aten_target(node)
+            is_recomputable = op_types.is_recomputable(node)
+            if is_watched:
+                # Check if common decomposition products are in allowlist
+                full_in_list = aten.full in op_types.recomputable_ops
+                empty_in_list = aten.empty in op_types.recomputable_ops
+                empty_like_in_list = aten.empty_like in op_types.recomputable_ops
+                # Check for fill_ (in-place mutation op - likely NOT in list)
+                fill_ops = [attr for attr in dir(aten) if attr.startswith("fill") and hasattr(getattr(aten, attr), "default")]
+                fill_in_list_info = "N/A"
+                if fill_ops:
+                    try:
+                        fill_op = getattr(aten, fill_ops[0])
+                        fill_in_list_info = f"aten.{fill_ops[0]} in recomputable_ops: {fill_op in op_types.recomputable_ops}"
+                    except:
+                        pass
+                
+                log.warning(
+                    f"[DEBUG ones_like/zeros_like/decomps] Node {node.name}: "
+                    f"ban_if_not_in_allowlist=True, checking recomputable status\n"
+                    f"  -> node.target: {node.target}\n"
+                    f"  -> get_aten_target(node): {aten_target}\n"
+                    f"  -> aten_target type: {type(aten_target)}\n"
+                    f"  -> aten_target in recomputable_ops: {aten_target in op_types.recomputable_ops}\n"
+                    f"  -> is_recomputable(node): {is_recomputable}\n"
+                    f"  -> aten.ones_like in recomputable_ops: {aten.ones_like in op_types.recomputable_ops}\n"
+                    f"  -> aten.zeros_like in recomputable_ops: {aten.zeros_like in op_types.recomputable_ops}\n"
+                    f"  -> aten.full in recomputable_ops: {full_in_list}\n"
+                    f"  -> aten.empty in recomputable_ops: {empty_in_list}\n"
+                    f"  -> aten.empty_like in recomputable_ops: {empty_like_in_list}\n"
+                    f"  -> {fill_in_list_info}"
+                )
+            if not is_recomputable:
+                if is_watched:
+                    log.warning(
+                        f"[DEBUG ones_like/zeros_like/decomps] Node {node.name}: "
+                        f"NOT in allowlist, BANNING recomputation\n"
+                        f"  -> This is likely the root cause! If this is a decomposition product (full/fill_), "
+                        f"  -> it needs to be added to recomputable_ops allowlist."
+                    )
                 return True
         else:
             if (
@@ -1870,6 +1941,11 @@ def solve_min_cut(
                 or op_types.is_compute_intensive(node)
                 or is_non_builtin_to_include(node)
             ):
+                if is_watched:
+                    log.warning(
+                        f"[DEBUG ones_like/zeros_like/decomps] Node {node.name}: "
+                        f"Is random/compute_intensive/non_builtin, BANNING recomputation"
+                    )
                 return True
 
         # If a node *must* be materialized in the backwards pass, then we
@@ -1877,17 +1953,34 @@ def solve_min_cut(
         # general, the assumption we make is that recomputing a node in the
         # backwards pass is "free". However, if a node must be materialized
         # in the backwards pass, then recomputing it is never free.
-        if min_cut_options.ban_if_materialized_backward and is_materialized_backwards(
-            node
-        ):
-            log.debug("materialized backwards: %s %s", node, tuple(node.users))
-            return True
+        if min_cut_options.ban_if_materialized_backward:
+            is_mat_backwards = is_materialized_backwards(node)
+            if is_watched:
+                log.warning(
+                    f"[DEBUG ones_like/zeros_like] Node {node.name}: "
+                    f"Checking materialized_backwards: {is_mat_backwards}\n"
+                    f"  -> ban_if_materialized_backward: {min_cut_options.ban_if_materialized_backward}"
+                )
+            if is_mat_backwards:
+                log.debug("materialized backwards: %s %s", node, tuple(node.users))
+                if is_watched:
+                    log.warning(
+                        f"[DEBUG ones_like/zeros_like/decomps] Node {node.name}: "
+                        f"Is materialized backwards, BANNING recomputation"
+                    )
+                return True
 
         # Arbitrary hack that sometimes seems to help things. The above
         # modification appears to have made this heuristic a lot less critical
         # for performance.
         # NB: As of PR #121692, this hack no longer seems necessary.
         if node.dist_from_bw < 1000 and node.dist_from_bw > config.max_dist_from_bw:
+            if is_watched:
+                log.warning(
+                    f"[DEBUG ones_like/zeros_like] Node {node.name}: "
+                    f"dist_from_bw check failed (dist={node.dist_from_bw}, "
+                    f"max_dist={config.max_dist_from_bw}), BANNING recomputation"
+                )
             return True
 
         # If the output of an op is 4x smaller (arbitrary choice),
@@ -1900,7 +1993,35 @@ def solve_min_cut(
                 _size_of(i) for i in node.args if isinstance(i, fx.Node)
             )
             output_size = _size_of(node)
-            return output_size * 4 < input_tensors_size
+            is_reduction = output_size * 4 < input_tensors_size
+            if is_watched:
+                log.warning(
+                    f"[DEBUG ones_like/zeros_like] Node {node.name}: "
+                    f"Checking reduction heuristic:\n"
+                    f"  -> input_tensors_size: {input_tensors_size}\n"
+                    f"  -> output_size: {output_size}\n"
+                    f"  -> output_size * 4 < input_tensors_size: {is_reduction}"
+                )
+            if is_reduction:
+                if is_watched:
+                    log.warning(
+                        f"[DEBUG ones_like/zeros_like/decomps] Node {node.name}: "
+                        f"Reduction heuristic triggered, BANNING recomputation"
+                    )
+                return output_size * 4 < input_tensors_size
+        
+        if is_watched:
+            # Additional debug: check for mutation/side effects
+            has_mutation = False
+            mutation_info = "N/A"
+            if hasattr(node.target, "_schema"):
+                has_mutation = any(arg.alias_info and arg.alias_info.is_write for arg in node.target._schema.arguments)
+                mutation_info = f"has_mutation={has_mutation}, is_mutable={getattr(node.target._schema, 'is_mutable', 'N/A')}"
+            log.warning(
+                f"[DEBUG ones_like/zeros_like/decomps] Node {node.name}: "
+                f"All checks passed, NOT banning recomputation\n"
+                f"  -> Mutation info: {mutation_info}"
+            )
         return False
 
     def is_materialized(node):
