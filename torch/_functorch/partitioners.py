@@ -1783,20 +1783,78 @@ def solve_min_cut(
         log.info("Ops banned from re-materialization: %s", ops_ignored)
 
     def can_fuse_into_auto_functionalized(a, b):
+        # Debug: Check what b.target actually is
+        node_target_str = str(a.target) if hasattr(a, 'target') else str(a)
+        is_watched = any(op in node_target_str for op in ["ones_like", "zeros_like", "full", "fill", "empty"])
+        
+        if is_watched:
+            log.warning(
+                f"[DEBUG can_fuse_into_auto_functionalized] Checking fusion:\n"
+                f"  -> a (producer): {a.name}\n"
+                f"  -> b (consumer): {b.name}\n"
+                f"  -> b.target: {b.target}\n"
+                f"  -> type(b.target): {type(b.target)}\n"
+                f"  -> torch.ops.higher_order.auto_functionalized: {torch.ops.higher_order.auto_functionalized}\n"
+                f"  -> torch.ops.higher_order.auto_functionalized_v2: {torch.ops.higher_order.auto_functionalized_v2}\n"
+                f"  -> b.target == auto_functionalized: {b.target == torch.ops.higher_order.auto_functionalized}\n"
+                f"  -> b.target == auto_functionalized_v2: {b.target == torch.ops.higher_order.auto_functionalized_v2}"
+            )
+        
         if b.target != torch.ops.higher_order.auto_functionalized:
+            if is_watched:
+                log.warning(
+                    f"[DEBUG can_fuse_into_auto_functionalized] Returning False at line 1803: "
+                    f"b.target != auto_functionalized (v1)"
+                )
             return False
+        
         mutable_op = b.args[0]
         (
             mutable_arg_names,
             _,
         ) = torch._higher_order_ops.auto_functionalize.get_mutable_args(mutable_op)
+        
+        if is_watched:
+            log.warning(
+                f"[DEBUG can_fuse_into_auto_functionalized] Passed v1 check, checking mutable args:\n"
+                f"  -> mutable_arg_names: {mutable_arg_names}\n"
+                f"  -> b.kwargs keys: {list(b.kwargs.keys())}"
+            )
+        
         for name in mutable_arg_names:
+            if name not in b.kwargs:
+                if is_watched:
+                    log.warning(
+                        f"[DEBUG can_fuse_into_auto_functionalized] Mutable arg '{name}' not in kwargs, skipping"
+                    )
+                continue
+            
             arg = b.kwargs[name]
+            if is_watched:
+                log.warning(
+                    f"[DEBUG can_fuse_into_auto_functionalized] Checking mutable arg '{name}':\n"
+                    f"  -> arg: {arg}\n"
+                    f"  -> a is arg: {a is arg}"
+                )
             if a is arg:
+                if is_watched:
+                    log.warning(
+                        f"[DEBUG can_fuse_into_auto_functionalized] Returning True: a is arg"
+                    )
                 return True
             if isinstance(arg, list):
                 if a in arg:
+                    if is_watched:
+                        log.warning(
+                            f"[DEBUG can_fuse_into_auto_functionalized] Returning True: a in arg list"
+                        )
                     return True
+        
+        if is_watched:
+            log.warning(
+                f"[DEBUG can_fuse_into_auto_functionalized] Returning False at line 1859: "
+                f"no matching mutable args found"
+            )
         return False
 
     def can_fuse_into_triton_kernel_wrapper_functional(a, b):
