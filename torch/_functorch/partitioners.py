@@ -1836,17 +1836,47 @@ def solve_min_cut(
         ) from e
 
     def is_materialized_backwards(node):
+        # Debug logging for watched nodes
+        node_target_str = str(node.target)
+        watch_list = ["ones_like", "zeros_like", "full", "fill", "empty", "copy"]
+        is_watched = any(op in node_target_str for op in watch_list)
+        
         if op_types.is_view(node):
+            if is_watched:
+                log.warning(
+                    f"[DEBUG materialized_backwards] Node {node.name}: "
+                    f"Is a view, returning False"
+                )
             return False
         cur_nodes = OrderedSet([node])
         while len(cur_nodes) > 0:
             cur = cur_nodes.pop()
             for user in cur.users:
-                if not node_info.is_required_fw(user) and not is_fusible(cur, user):
+                is_user_required_fw = node_info.is_required_fw(user)
+                is_cur_user_fusible = is_fusible(cur, user)
+                if is_watched:
+                    log.warning(
+                        f"[DEBUG materialized_backwards] Node {cur.name} -> User {user.name}: "
+                        f"is_required_fw(user)={is_user_required_fw}, "
+                        f"is_fusible(cur, user)={is_cur_user_fusible}, "
+                        f"user.target={user.target}"
+                    )
+                if not is_user_required_fw and not is_cur_user_fusible:
+                    if is_watched:
+                        log.warning(
+                            f"[DEBUG materialized_backwards] Node {cur.name}: "
+                            f"MATERIALIZED BACKWARDS because user {user.name} is not in fw "
+                            f"and not fusible (user.target={user.target})"
+                        )
                     return True
                 if op_types.is_view(user):
                     cur_nodes.add(user)
 
+        if is_watched:
+            log.warning(
+                f"[DEBUG materialized_backwards] Node {node.name}: "
+                f"All checks passed, NOT materialized backwards"
+            )
         return False
 
     def should_ban_recomputation(node):
